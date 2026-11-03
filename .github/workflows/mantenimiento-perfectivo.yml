@@ -67,7 +67,7 @@ jobs:
       - name: Instalar dependencias
         run: npm ci
 
-      - name: Lint (oxlint) — informativo: avisos y errores preexistentes del repositorio
+      - name: Lint (oxlint) — informativo (avisos y errores preexistentes del repositorio)
         # El repositorio ya tenía advertencias y dos errores de estilo en src/
         # (p. ej. eqeqeq en NewProposalForm.tsx), ajenos al objeto del cambio.
         # Para el experimento se registra la salida sin romper el pipeline:
