@@ -158,9 +158,25 @@ jobs:
           git checkout --force "$BASE_SHA"
           npm ci
           npm run build
-          PW_WITH_SERVER=1 SNAPSHOT_MODE=update BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+          # Servidor gestionado por el WORKFLOW (no por Playwright): así no se
+          # depende del webServer de la revisión ANTES. Las revisiones históricas
+          # (7e71e02 y anteriores) no anclan vite preview a 127.0.0.1 y, en
+          # ubuntu-latest, localhost resuelve a ::1 (solo IPv6) → ERR_CONNECTION_REFUSED
+          # (fallo verificado en los Runs #2 y #3). Sin PW_WITH_SERVER, el propio
+          # workflow es quien levanta el servidor y quien lo detiene.
+          npx vite preview --host 127.0.0.1 --port ${{ env.PUERTO_PREVIEW }} --strictPort > /tmp/preview.log 2>&1 &
+          PREVIEW_PID=$!
+          for i in $(seq 1 60); do
+            curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/" && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/"
+          SNAPSHOT_MODE=update BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
             npx playwright test --config=e2e/playwright.config.ts --update-snapshots=all
           tar -czf "$RUNNER_TEMP/baselines.tgz" e2e/regresion-visual.rv.ts-snapshots
+          kill "$PREVIEW_PID" 2>/dev/null || true
+          pkill -f "vite preview" 2>/dev/null || true
+          sleep 1
 
       - name: ETAPA 2 · revisión DESPUÉS — verificar contra las baselines
         env:
@@ -170,21 +186,44 @@ jobs:
           git checkout --force "$HEAD_SHA"
           npm ci
           npm run build
-          PW_WITH_SERVER=1 BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+          npx vite preview --host 127.0.0.1 --port ${{ env.PUERTO_PREVIEW }} --strictPort > /tmp/preview.log 2>&1 &
+          PREVIEW_PID=$!
+          for i in $(seq 1 60); do
+            curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/" && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/"
+          BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
             npx playwright test --config=e2e/playwright.config.ts
+          kill "$PREVIEW_PID" 2>/dev/null || true
+          pkill -f "vite preview" 2>/dev/null || true
+          sleep 1
 
       - name: ETAPA 3 · demo del control de detección (el parche controlado SI debe fallar)
         if: ${{ inputs.demo_fallo != false }}
         run: |
           set -uo pipefail
           git apply demo/regresion-visual-demo.patch
-          if PW_WITH_SERVER=1 BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+          # El parche toca el código fuente: RECONSTRUIR el dist para que la
+          # alteración controlada se refleje en el servidor de preview.
+          npm run build
+          npx vite preview --host 127.0.0.1 --port ${{ env.PUERTO_PREVIEW }} --strictPort > /tmp/preview.log 2>&1 &
+          PREVIEW_PID=$!
+          for i in $(seq 1 60); do
+            curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/" && break
+            sleep 1
+          done
+          curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/"
+          if BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
              npx playwright test --config=e2e/playwright.config.ts; then
             echo "::error::El parche de demostración debió provocar fallos en las pruebas visuales"
             exit 1
           else
             echo "::notice::Demo correcta: la suite DETECTÓ el cambio controlado (fallo esperado)"
           fi
+          kill "$PREVIEW_PID" 2>/dev/null || true
+          pkill -f "vite preview" 2>/dev/null || true
+          sleep 1
           git apply -R demo/regresion-visual-demo.patch
 
       - name: Cerrar el resumen de RV-01
