@@ -25,9 +25,9 @@ import scivalLogo from '../assets/images/scival.jpg';
 import scopusLogo from '../assets/images/scopus.png';
 import taylorFrancisLogo from '../assets/images/taylorFrancis.jpg';
 import scienceDirectLogo from '../assets/images/sciencieDirect.png';
-import convocatoriasBg from '../assets/images/convocatorias.png';
-import reconocimientoBg from '../assets/images/reconocimineto.png';
-import congresosBg from '../assets/images/congresos.png';
+import convocatoriasBg from '../assets/images/convocatorias.webp';
+import reconocimientoBg from '../assets/images/reconocimineto.webp';
+import congresosBg from '../assets/images/congresos.webp';
 
 export const WelcomePage: React.FC = () => {
   const { isAuthenticated } = useContext(AuthContext);

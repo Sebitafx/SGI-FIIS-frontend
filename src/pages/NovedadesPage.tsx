@@ -12,9 +12,9 @@ import { researchService } from '../services/researchService';
 import type { ResearchLine } from '../services/researchService';
 
 // Import news images
-import convocatoriasBg from '../assets/images/convocatorias.png';
-import reconocimientoBg from '../assets/images/reconocimineto.png';
-import congresosBg from '../assets/images/congresos.png';
+import convocatoriasBg from '../assets/images/convocatorias.webp';
+import reconocimientoBg from '../assets/images/reconocimineto.webp';
+import congresosBg from '../assets/images/congresos.webp';
 
 // Import social logos
 import facebookLogo from '../assets/images/logos/logotipo-circular-de-facebook.png';
