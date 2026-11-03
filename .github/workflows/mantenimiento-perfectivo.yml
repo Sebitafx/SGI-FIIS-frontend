@@ -262,11 +262,29 @@ jobs:
           export RP02_URLS="$(node k6/extraer_assets.mjs "$PWD/dist" --env)"
           echo "RP02_URLS=$RP02_URLS"
           RP02_VUS=5 RP02_DURATION=15s JSON_OUT=k6/salidas/rp02-rapido.json \
+            RESUMEN_OUT=k6/salidas/rp02-rapido-resumen.json \
             k6 run k6/rp02_recursos.js 2>&1 | tee /tmp/rp02-rapido.log
 
+      # RP-01 usa el navegador de k6 (xk6-browser). En los runners hospedados de
+      # GitHub, Chromium no puede iniciarse porque /sys/devices/system/cpu/cpu0/
+      # cpufreq no existe ahí (limitación conocida y documentada de k6-browser en
+      # nube: el proceso aborta con exit 108). RP-01 se ejecuta en la máquina de
+      # trabajo del equipo y aquí se publican RP-02 (HTTP puro) y los tiempos de
+      # pipeline; si algún runner expone cpufreq, el paso corre sin cambios.
       - name: RP-01 — navegación real en el navegador
         run: |
           set -uo pipefail
+          if [ ! -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
+            {
+              echo "> **Nota — RP-01 (navegador) omitido en CI:** \`/sys/devices/system/cpu/cpu0/cpufreq\`"
+              echo "> no existe en los runners hospedados de GitHub y el Chromium integrado de k6"
+              echo "> no arranca sin él (exit 108; limitación conocida de k6-browser en nube)."
+              echo "> El gate de rendimiento en CI es **RP-02 (HTTP)**; RP-01 se ejecuta localmente"
+              echo "> y sus mediciones se archivan como evidencia del experimento."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "RP-01 omitido: cpufreq no disponible en este runner (limitación conocida)."
+            exit 0
+          fi
           mkdir -p k6/salidas
           if [ -x /usr/bin/google-chrome ]; then export K6_BROWSER_PATH=/usr/bin/google-chrome; fi
           export K6_BROWSER_HEADLESS=true
@@ -288,9 +306,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           if [ -f k6/salidas/rp02-rapido.json ]; then
             for r in convocatorias congresos reconocimineto; do
-              med=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:$r}" \
+              med=$(jq -r --arg k "rp02_${r}_ms" \
                     '.metrics[$k].values.med // 0' k6/salidas/rp02-rapido.json)
-              byt=$(jq -r --arg k "rp02_bytes{recurso:$r}" \
+              byt=$(jq -r --arg k "rp02_${r}_bytes" \
                     '.metrics[$k].values.med // 0' k6/salidas/rp02-rapido.json)
               echo "- RP-02 \`$r\`: mediana ${med} ms · ${byt} B" >> "$GITHUB_STEP_SUMMARY"
             done
@@ -299,6 +317,9 @@ jobs:
             med=$(jq -r '.metrics["section_ready_ms"].values.med // 0' k6/salidas/rp01-rapido.json)
             tot=$(jq -r '.metrics["page_body_bytes"].values.med // 0' k6/salidas/rp01-rapido.json)
             echo "- RP-01: sección de noticias lista en mediana ${med} ms · total recursos ${tot} B" \
+              >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- RP-01: omitido en este runner (sin \`/sys ... cpufreq\`; ver nota arriba)" \
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -402,11 +423,21 @@ jobs:
           export K6_BROWSER_ARGS="--no-sandbox"
           if [ -x /usr/bin/google-chrome ]; then export K6_BROWSER_PATH=/usr/bin/google-chrome; fi
           mkdir -p k6/salidas
+          # RP-01 (navegador): solo si el runner expone cpufreq (limitación de
+          # k6-browser en nube); RP-02 (HTTP) siempre es la puerta del pipeline.
+          NAVEGADOR_DISPONIBLE=0
+          if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then NAVEGADOR_DISPONIBLE=1; fi
           for i in 1 2 3; do
-            TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
-              JSON_OUT="k6/salidas/rp01-antes-$i.json" k6 run k6/rp01_carga_pagina.js \
-              > "/tmp/rp01-antes-$i.log" 2>&1
+            if [ "$NAVEGADOR_DISPONIBLE" = "1" ]; then
+              TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+                JSON_OUT="k6/salidas/rp01-antes-$i.json" k6 run k6/rp01_carga_pagina.js \
+                > "/tmp/rp01-antes-$i.log" 2>&1
+            else
+              echo "RP-01 ANTES rep $i: omitido (runner sin cpufreq; limitación conocida de k6-browser)" \
+                > "/tmp/rp01-antes-$i.log"
+            fi
             RP02_VUS=5 RP02_DURATION=30s JSON_OUT="k6/salidas/rp02-antes-$i.json" \
+              RESUMEN_OUT="k6/salidas/rp02-antes-$i-resumen.json" RP02_ETIQUETA="antes-rep$i" \
               k6 run k6/rp02_recursos.js > "/tmp/rp02-antes-$i.log" 2>&1
           done
           kill "$(cat /tmp/server-antes.pid)" 2>/dev/null || true
@@ -422,11 +453,19 @@ jobs:
           export K6_BROWSER_ARGS="--no-sandbox"
           if [ -x /usr/bin/google-chrome ]; then export K6_BROWSER_PATH=/usr/bin/google-chrome; fi
           mkdir -p k6/salidas
+          NAVEGADOR_DISPONIBLE=0
+          if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then NAVEGADOR_DISPONIBLE=1; fi
           for i in 1 2 3; do
-            TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
-              JSON_OUT="k6/salidas/rp01-despues-$i.json" k6 run k6/rp01_carga_pagina.js \
-              > "/tmp/rp01-despues-$i.log" 2>&1
+            if [ "$NAVEGADOR_DISPONIBLE" = "1" ]; then
+              TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+                JSON_OUT="k6/salidas/rp01-despues-$i.json" k6 run k6/rp01_carga_pagina.js \
+                > "/tmp/rp01-despues-$i.log" 2>&1
+            else
+              echo "RP-01 DESPUÉS rep $i: omitido (runner sin cpufreq; limitación conocida de k6-browser)" \
+                > "/tmp/rp01-despues-$i.log"
+            fi
             RP02_VUS=5 RP02_DURATION=30s JSON_OUT="k6/salidas/rp02-despues-$i.json" \
+              RESUMEN_OUT="k6/salidas/rp02-despues-$i-resumen.json" RP02_ETIQUETA="despues-rep$i" \
               k6 run k6/rp02_recursos.js > "/tmp/rp02-despues-$i.log" 2>&1
           done
           kill "$(cat /tmp/server-despues.pid)" 2>/dev/null || true
@@ -442,11 +481,15 @@ jobs:
               for i in 1 2 3; do
                 f1="k6/salidas/rp01-$rev-$i.json"
                 f2="k6/salidas/rp02-$rev-$i.json"
-                a=$(jq -r '.metrics["section_ready_ms"].values.med // 0' "$f1")
-                c1=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:convocatorias}" '.metrics[$k].values.med // 0' "$f2")
-                c2=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:congresos}" '.metrics[$k].values.med // 0' "$f2")
-                c3=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:reconocimineto}" '.metrics[$k].values.med // 0' "$f2")
-                echo "| $rev | $i | ${a} ms | ${c1} ms | ${c2} ms | ${c3} ms |"
+                if [ -f "$f1" ]; then
+                  a="$(jq -r '.metrics["section_ready_ms"].values.med // 0' "$f1") ms"
+                else
+                  a="omitido (sin cpufreq en CI)"
+                fi
+                c1=$(jq -r --arg k "rp02_convocatorias_ms" '.metrics[$k].values.med // 0' "$f2")
+                c2=$(jq -r --arg k "rp02_congresos_ms" '.metrics[$k].values.med // 0' "$f2")
+                c3=$(jq -r --arg k "rp02_reconocimineto_ms" '.metrics[$k].values.med // 0' "$f2")
+                echo "| $rev | $i | ${a} | ${c1} ms | ${c2} ms | ${c3} ms |"
               done
             done
           } >> "$GITHUB_STEP_SUMMARY"

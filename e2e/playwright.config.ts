@@ -119,11 +119,19 @@ export default defineConfig({
   },
 
   /* Servidor opcional: solo cuando se pida con PW_WITH_SERVER=1 (usado en el
-   * workflow de GitHub Actions). Levanta `npm run preview` (vite preview en el
-   * puerto 4173 del build ya compilado, dist/) y espera a que responda. */
+   * workflow de GitHub Actions). Levanta `vite preview` en el puerto 4173 del
+   * build ya compilado (dist/) y espera a que responda.
+   *
+   * IMPORTANTE: se fija --host 127.0.0.1 de forma explícita. En ubuntu-latest,
+   * `localhost` resuelve a ::1 y `vite preview` queda escuchando SOLO en IPv6;
+   * como la URL del experimento es http://127.0.0.1:4173 (IPv4), los tests
+   * obtenían ERR_CONNECTION_REFUSED aunque el servidor estuviera vivo (fallo
+   * del Run #2, job 02). Anclar a 127.0.0.1 hace el comportamiento idéntico en
+   * Windows (local) y en Linux (CI). */
   webServer: process.env.PW_WITH_SERVER
     ? {
-        command: 'npm run preview',
+        command: 'npm run preview -- --host 127.0.0.1 --port 4173 --strictPort',
+        url: 'http://127.0.0.1:4173/',
         port: 4173,
         timeout: 90_000,
         reuseExistingServer: true,
