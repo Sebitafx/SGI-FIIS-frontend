@@ -1,0 +1,11 @@
+--- a/src/pages/WelcomePage.css
++++ b/src/pages/WelcomePage.css
+@@ -1131,7 +1131,7 @@
+   min-width: 250px;
+   height: 330px;
+   /* Altura fija para que la transición sea uniforme */
+-  background-size: cover;
++  background-size: contain;
+   background-position: center;
+   border: 1px solid rgba(255, 255, 255, 0.15);
+   border-radius: 16px;

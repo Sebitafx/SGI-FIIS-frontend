@@ -24,3 +24,16 @@ dist-ssr
 *.sw?
 pnpm-lock.yaml
 documentacion/
+
+# ─── Experimento RV/RP (Tema 5 · Mantenimiento) ───
+# Baselines visuales y diferencias: se generan POR ENTORNO (update) y NO se
+# versionan; el workflow de Actions las crea en la etapa ANTES y las consume
+# en la DESPUÉS dentro del mismo runner, y en local se conservan sin commitear.
+e2e/__screenshots__/
+e2e/*-snapshots/
+e2e/control-diff/
+e2e/test-results/
+e2e/reports/
+k6/salidas/
+k6/urls.json
+

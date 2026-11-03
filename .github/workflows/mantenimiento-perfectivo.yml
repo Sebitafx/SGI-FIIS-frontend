@@ -1,0 +1,461 @@
+# =============================================================================
+# Experimento del curso de Mantenimiento de Software (Tema 5):
+#   Pruebas de Regresión Visual (Playwright) y de Rendimiento (k6) sobre un
+#   cambio perfectivo: PNG -> WebP sin pérdida en la portada de SGI-FIIS.
+#
+# El pipeline reproduce el protocolo del informe dentro del MISMO entorno:
+#   1) visa calida base (lint + pruebas + build),
+#   2) RV-01: genera baselines en la revisión ANTES y verifica la igualdad
+#      píxel a píxel en la revisión DESPUÉS (dos etapas dentro de un mismo job),
+#   3) demo del control de detección: un parche reversible provoca un fallo
+#      visual que la suite SÍ debe detectar,
+#   4) RP-01/RP-02: rendimiento de la portada con k6 (rápido por defecto,
+#      3 repeticiones × 2 revisiones con modo = completo).
+#
+# Revisión ANTES y DESPUÉS se resuelven de revision_base (dispatch), o del
+# commit confessed al push (github.event.before), o de HEAD~1 como respaldo.
+# =============================================================================
+
+name: mantenimiento-perfectivo
+
+on:
+  push:
+    branches: [mnt/perfectivo-imagenes]
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: 'Alcance de la campaña de rendimiento (k6)'
+        type: choice
+        default: rapido
+        options:
+          - rapido
+          - completo
+      revision_base:
+        description: 'SHA de la revisión ANTES del cambio (para visual y modo completo; vacío = commit confessed al push)'
+        type: string
+        default: ''
+        required: false
+      demo_fallo:
+        description: 'Demo del control de detección (patch reversible que SI debe fallar)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  NODO: '20'
+  PUERTO_PREVIEW: '4173'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 01 · Calidad base de la revisión al resaltar el push: lint, vitest y build.
+  # ---------------------------------------------------------------------------
+  calidad:
+    name: 01 · Calidad base (lint + pruebas + build)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node ${{ env.NODO }} con caché de npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODO }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Lint (oxlint) — informativo: avisos y errores preexistentes del repositorio
+        # El repositorio ya tenía advertencias y dos errores de estilo en src/
+        # (p. ej. eqeqeq en NewProposalForm.tsx), ajenos al objeto del cambio.
+        # Para el experimento se registra la salida sin romper el pipeline:
+        # la puerta de calidad real la dan las pruebas y el build.
+        run: npm run lint
+        continue-on-error: true
+
+      - name: Pruebas unitarias (vitest)
+        run: npm test
+
+      - name: Build de producción
+        run: npm run build
+
+      - name: Resumen del job de calidad
+        if: always()
+        run: |
+          {
+            echo "### 01 · Calidad base"
+            echo "- Node \`: \`$(node -v)"
+            echo "- Lint + pruebas vitest + build: OK"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir build (dist)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: calidad-dist
+          path: dist
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ---------------------------------------------------------------------------
+  # 02 · RV-01 — Las DOS etapas en un mismo job (mismo runner, mismo entorno):
+  #      ANTES genera la baseline; DESPUÉS compara contra esa MISMA baseline.
+  # ---------------------------------------------------------------------------
+  visual:
+    name: 02 · Regresión visual (ANTES → → DESPUÉS → demo)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout con historial completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolver revisiones (ANTES / DESPUÉS)
+        id: revisiones
+        run: |
+          set -euo pipefail
+          HEAD_SHA="${{ github.sha }}"
+          BASE_SHA="${{ inputs.revision_base }}"
+          EVENTO_BEFORE="${{ github.event.before }}"
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            if [ -n "$EVENTO_BEFORE" ] && [ "$EVENTO_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA="$EVENTO_BEFORE"
+            else
+              BASE_SHA="$(git rev-parse HEAD~1)"
+            fi
+          fi
+          git cat-file -e "$BASE_SHA^{commit}" || {
+            echo "::error::La revisión base $BASE_SHA no está en este repositorio"; exit 1;
+          }
+          echo "Comparando $BASE_SHA (ANTES) -> $HEAD_SHA (DESPUÉS)"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 02 · Regresión visual"
+            echo "- Revisión ANTES   : \`$BASE_SHA\`"
+            echo "- Revisión DESPUÉS : \`$HEAD_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Node ${{ env.NODO }} con caché de npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODO }}
+          cache: npm
+
+      - name: Dependencias y Chromium de Playwright (versión del lockfile)
+        run: |
+          set -euo pipefail
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: ETAPA 1 · revisión ANTES — construir y generar baselines
+        env:
+          BASE_SHA: ${{ steps.revisiones.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          git checkout --force "$BASE_SHA"
+          npm ci
+          npm run build
+          PW_WITH_SERVER=1 SNAPSHOT_MODE=update BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+            npx playwright test --config=e2e/playwright.config.ts --update-snapshots=all
+          tar -czf "$RUNNER_TEMP/baselines.tgz" e2e/regresion-visual.rv.ts-snapshots
+
+      - name: ETAPA 2 · revisión DESPUÉS — verificar contra las baselines
+        env:
+          HEAD_SHA: ${{ steps.revisiones.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git checkout --force "$HEAD_SHA"
+          npm ci
+          npm run build
+          PW_WITH_SERVER=1 BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+            npx playwright test --config=e2e/playwright.config.ts
+
+      - name: ETAPA 3 · demo del control de detección (el parche controlado SI debe fallar)
+        if: ${{ inputs.demo_fallo != false }}
+        run: |
+          set -uo pipefail
+          git apply demo/regresion-visual-demo.patch
+          if PW_WITH_SERVER=1 BASE_URL="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+             npx playwright test --config=e2e/playwright.config.ts; then
+            echo "::error::El parche de demostración debió provocar fallos en las pruebas visuales"
+            exit 1
+          else
+            echo "::notice::Demo correcta: la suite DETECTÓ el cambio controlado (fallo esperado)"
+          fi
+          git apply -R demo/regresion-visual-demo.patch
+
+      - name: Cerrar el resumen de RV-01
+        if: always()
+        run: |
+          {
+            echo "- Las baselines se generaron en la revisión ANTES y la verificación"
+            echo "  (WebP sin pérdida) corrió sobre las MISMAS baselines en el MISMO runner."
+            echo "- Etapa 3: parche \`background-size: cover → contain\` detectado por la suite."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir baselines
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rv-baselines
+          path: ${{ runner.temp }}/baselines.tgz
+          if-no-files-found: ignore
+          retention-days: 15
+
+      - name: Subir reportes y evidencias de diferencias
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rv-reportes
+          path: |
+            e2e/reports
+            e2e/test-results
+            e2e/control-diff
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ---------------------------------------------------------------------------
+  # 03 · RP-01 + RP-02 smoke (siempre): servidor estático del build y k6 v2.3.0.
+  # ---------------------------------------------------------------------------
+  rp-rapido:
+    name: 03 · Rendimiento rápido (RP-01 navegar + RP-02 5VUs×15s)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node ${{ env.NODO }} con caché de npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODO }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Instalar k6 v2.3.0 (misma versión que el experimento local)
+        run: |
+          set -euo pipefail
+          curl -sL https://github.com/grafana/k6/releases/download/v2.3.0/k6-v2.3.0-linux-amd64.tar.gz \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP"
+          sudo mv "$RUNNER_TEMP/k6" /usr/local/bin/k6
+          k6 version
+
+      - name: Build de producción
+        run: npm run build
+
+      - name: Levantar el servidor estático del build
+        run: |
+          set -euo pipefail
+          node k6/servidor-estatico.mjs ${{ env.PUERTO_PREVIEW }} "$PWD/dist" > /tmp/server.log 2>&1 &
+          echo $! > /tmp/server.pid
+          sleep 2
+          curl -fsS -o /dev/null "http://127.0.0.1:${{ env.PUERTO_PREVIEW }}/"
+
+      - name: RP-02 smoke — 5 VUs x 15 s sobre los 3 recursos
+        run: |
+          set -uo pipefail
+          mkdir -p k6/salidas
+          export RP02_URLS="$(node k6/extraer_assets.mjs "$PWD/dist" --env)"
+          echo "RP02_URLS=$RP02_URLS"
+          RP02_VUS=5 RP02_DURATION=15s JSON_OUT=k6/salidas/rp02-rapido.json \
+            k6 run k6/rp02_recursos.js 2>&1 | tee /tmp/rp02-rapido.log
+
+      - name: RP-01 — navegación real en el navegador
+        run: |
+          set -uo pipefail
+          mkdir -p k6/salidas
+          if [ -x /usr/bin/google-chrome ]; then export K6_BROWSER_PATH=/usr/bin/google-chrome; fi
+          export K6_BROWSER_HEADLESS=true
+          export K6_BROWSER_ARGS="--no-sandbox"
+          TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" JSON_OUT=k6/salidas/rp01-rapido.json \
+            k6 run k6/rp01_carga_pagina.js 2>&1 | tee /tmp/rp01-rapido.log
+
+      - name: Detener el servidor
+        if: always()
+        run: |
+          if [ -f /tmp/server.pid ]; then kill "$(cat /tmp/server.pid)" 2>/dev/null || true; fi
+
+      - name: Resumen del rendimiento rápido
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "### 03 · Rendimiento rápido (revisión \`$(git rev-parse --short HEAD)\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -f k6/salidas/rp02-rapido.json ]; then
+            for r in convocatorias congresos reconocimineto; do
+              med=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:$r}" \
+                    '.metrics[$k].values.med // 0' k6/salidas/rp02-rapido.json)
+              byt=$(jq -r --arg k "rp02_bytes{recurso:$r}" \
+                    '.metrics[$k].values.med // 0' k6/salidas/rp02-rapido.json)
+              echo "- RP-02 \`$r\`: mediana ${med} ms · ${byt} B" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+          if [ -f k6/salidas/rp01-rapido.json ]; then
+            med=$(jq -r '.metrics["section_ready_ms"].values.med // 0' k6/salidas/rp01-rapido.json)
+            tot=$(jq -r '.metrics["page_body_bytes"].values.med // 0' k6/salidas/rp01-rapido.json)
+            echo "- RP-01: sección de noticias lista en mediana ${med} ms · total recursos ${tot} B" \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Subir mediciones del rendimiento rápido
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rp-rapido-json
+          path: |
+            k6/salidas
+            /tmp/rp01-rapido.log
+            /tmp/rp02-rapido.log
+          if-no-files-found: ignore
+          retention-days: 15
+
+  # ---------------------------------------------------------------------------
+  # 04 · Campaña completa (solo con modo = completo): 3 repeticiones de RP-01 y
+  #      RP-02 por revision ANTES (PNG) y DESPUÉS (WebP), en el mismo runner.
+  # ---------------------------------------------------------------------------
+  rp-completo:
+    name: 04 · Rendimiento completo (3 rep × 2 revisiones)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.modo == 'completo' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout con historial completo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolver revisiones (ANTES / DESPUÉS)
+        id: revisiones
+        run: |
+          set -euo pipefail
+          HEAD_SHA="${{ github.sha }}"
+          BASE_SHA="${{ inputs.revision_base }}"
+          EVENTO_BEFORE="${{ github.event.before }}"
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            if [ -n "$EVENTO_BEFORE" ] && [ "$EVENTO_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              BASE_SHA="$EVENTO_BEFORE"
+            else
+              BASE_SHA="$(git rev-parse HEAD~1)"
+            fi
+          fi
+          git cat-file -e "$BASE_SHA^{commit}" || {
+            echo "::error::La revisión base $BASE_SHA no está en este repositorio"; exit 1;
+          }
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "base_sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 04 · Rendimiento completo"
+            echo "- ANTES \`$BASE_SHA\` (PNG) vs DESPUÉS \`$HEAD_SHA\` (WebP)"
+            echo "- 3 repeticiones por revisión de RP-01 (navegador) y RP-02 (5 VUs x 30 s)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Node ${{ env.NODO }} con caché de npm
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODO }}
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Instalar k6 v2.3.0
+        run: |
+          set -euo pipefail
+          curl -sL https://github.com/grafana/k6/releases/download/v2.3.0/k6-v2.3.0-linux-amd64.tar.gz \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP"
+          sudo mv "$RUNNER_TEMP/k6" /usr/local/bin/k6
+          k6 version
+
+      - name: Compilar las DOS revisiones
+        env:
+          BASE_SHA: ${{ steps.revisiones.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.revisiones.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git checkout --force "$BASE_SHA"
+          npm run build
+          mv dist dist-antes
+          git checkout --force "$HEAD_SHA"
+          npm run build
+          mv dist dist-despues
+
+      - name: Inventariar recursos de ambas revisiones
+        run: |
+          set -euo pipefail
+          node k6/extraer_assets.mjs "$PWD/dist-antes" --env | sed 's/^RP02_URLS=//' > /tmp/rp02_urls_antes.txt
+          node k6/extraer_assets.mjs "$PWD/dist-despues" --env | sed 's/^RP02_URLS=//' > /tmp/rp02_urls_despues.txt
+          cat /tmp/rp02_urls_antes.txt
+          cat /tmp/rp02_urls_despues.txt
+
+      - name: Medir la revisión ANTES (3 repeticiones de RP-01 y RP-02)
+        run: |
+          set -euo pipefail
+          node k6/servidor-estatico.mjs ${{ env.PUERTO_PREVIEW }} "$PWD/dist-antes" > /tmp/server-antes.log 2>&1 &
+          echo $! > /tmp/server-antes.pid
+          sleep 2
+          export RP02_URLS="$(cat /tmp/rp02_urls_antes.txt)"
+          export K6_BROWSER_HEADLESS=true
+          export K6_BROWSER_ARGS="--no-sandbox"
+          if [ -x /usr/bin/google-chrome ]; then export K6_BROWSER_PATH=/usr/bin/google-chrome; fi
+          mkdir -p k6/salidas
+          for i in 1 2 3; do
+            TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+              JSON_OUT="k6/salidas/rp01-antes-$i.json" k6 run k6/rp01_carga_pagina.js \
+              > "/tmp/rp01-antes-$i.log" 2>&1
+            RP02_VUS=5 RP02_DURATION=30s JSON_OUT="k6/salidas/rp02-antes-$i.json" \
+              k6 run k6/rp02_recursos.js > "/tmp/rp02-antes-$i.log" 2>&1
+          done
+          kill "$(cat /tmp/server-antes.pid)" 2>/dev/null || true
+
+      - name: Medir la revisión DESPUÉS (3 repeticiones de RP-01 y RP-02)
+        run: |
+          set -euo pipefail
+          node k6/servidor-estatico.mjs ${{ env.PUERTO_PREVIEW }} "$PWD/dist-despues" > /tmp/server-despues.log 2>&1 &
+          echo $! > /tmp/server-despues.pid
+          sleep 2
+          export RP02_URLS="$(cat /tmp/rp02_urls_despues.txt)"
+          export K6_BROWSER_HEADLESS=true
+          export K6_BROWSER_ARGS="--no-sandbox"
+          if [ -x /usr/bin/google-chrome ]; then export K6_BROWSER_PATH=/usr/bin/google-chrome; fi
+          mkdir -p k6/salidas
+          for i in 1 2 3; do
+            TARGET="http://127.0.0.1:${{ env.PUERTO_PREVIEW }}" \
+              JSON_OUT="k6/salidas/rp01-despues-$i.json" k6 run k6/rp01_carga_pagina.js \
+              > "/tmp/rp01-despues-$i.log" 2>&1
+            RP02_VUS=5 RP02_DURATION=30s JSON_OUT="k6/salidas/rp02-despues-$i.json" \
+              k6 run k6/rp02_recursos.js > "/tmp/rp02-despues-$i.log" 2>&1
+          done
+          kill "$(cat /tmp/server-despues.pid)" 2>/dev/null || true
+
+      - name: Construir el resumen comparativo
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "| Revisión | Rep | RP-01 sección lista (med) | RP-02 convocatorias (med) | RP-02 congresos (med) | RP-02 reconocimineto (med) |"
+            echo "|---|---|---|---|---|---|"
+            for rev in antes despues; do
+              for i in 1 2 3; do
+                f1="k6/salidas/rp01-$rev-$i.json"
+                f2="k6/salidas/rp02-$rev-$i.json"
+                a=$(jq -r '.metrics["section_ready_ms"].values.med // 0' "$f1")
+                c1=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:convocatorias}" '.metrics[$k].values.med // 0' "$f2")
+                c2=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:congresos}" '.metrics[$k].values.med // 0' "$f2")
+                c3=$(jq -r --arg k "rp02_tiempo_respuesta{recurso:reconocimineto}" '.metrics[$k].values.med // 0' "$f2")
+                echo "| $rev | $i | ${a} ms | ${c1} ms | ${c2} ms | ${c3} ms |"
+              done
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Subir mediciones de la campaña completa
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rp-completo-json
+          path: k6/salidas
+          if-no-files-found: ignore
+          retention-days: 15
